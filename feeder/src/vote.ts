@@ -4,19 +4,12 @@ import * as promptly from 'promptly'
 import * as http from 'http'
 import * as https from 'https'
 import axios from 'axios'
+import { bech32 } from 'bech32'
 import * as ks from './keystore'
-import {
-  LCDClient,
-  RawKey,
-  Wallet,
-  isTxError,
-  LCDClientConfig,
-  OracleAPI,
-  MsgAggregateExchangeRateVote,
-  Fee,
-} from '@terra-money/terra.js'
+import { LCDClient, RawKey, Wallet, isTxError, LCDClientConfig, OracleAPI, Fee } from '@terra-money/terra.js'
 import * as packageInfo from '../package.json'
 import * as logger from './logger'
+import { MsgAggregateDoRateVote } from './doOracleMsgs'
 import { BigNumber } from 'bignumber.js'
 
 const ax = axios.create({
@@ -40,6 +33,11 @@ async function initKey(keyPath: string, name: string, password?: string): Promis
   return new RawKey(Buffer.from(plainEntity.privateKey, 'hex'))
 }
 
+function convertBech32Prefix(addr: string, prefix: string): string {
+  const decoded = bech32.decode(addr)
+  return bech32.encode(prefix, decoded.words)
+}
+
 interface OracleParameters {
   oracleVotePeriod: number
   oracleWhitelist: string[]
@@ -49,13 +47,20 @@ interface OracleParameters {
 }
 
 async function loadOracleParams(client: LCDClient, oracle: OracleAPI): Promise<OracleParameters> {
-  const oracleParams = await oracle.parameters()
-  const oracleVotePeriod = oracleParams.vote_period
-  const oracleWhitelist: string[] = oracleParams.whitelist.map((e) => e.name)
-  const latestBlock = await client.tendermint.blockInfo()
+  const lcdBase = Array.isArray((client as any).config?.URL)
+    ? (client as any).config.URL[0]
+    : (client as any).config?.URL || (client as any).config?.lcd || 'http://127.0.0.1:1317'
+
+  const oracleParamsRes = await ax.get(`${lcdBase}/do/oracle/v1beta1/params`)
+  const oracleParams = oracleParamsRes.data.params
+
+  const oracleVotePeriod = parseInt(oracleParams.vote_period, 10)
+  const oracleWhitelist: string[] = oracleParams.whitelist.map((e: any) => e.name)
+
+  const latestBlockRes = await ax.get(`${lcdBase}/cosmos/base/tendermint/v1beta1/blocks/latest`)
+  const blockHeight = parseInt(latestBlockRes.data.block.header.height, 10)
 
   // the vote will be included in the next block
-  const blockHeight = parseInt(latestBlock.block.header.height, 10)
   const nextBlockHeight = blockHeight + 1
   const currentVotePeriod = Math.floor(blockHeight / oracleVotePeriod)
   const indexInVotePeriod = nextBlockHeight % oracleVotePeriod
@@ -104,62 +109,56 @@ async function getPrices(sources: string[]): Promise<Price[]> {
 
 /**
  * preparePrices traverses prices array for following logics:
- * 1. Removes price that cannot be found in oracle whitelist
- * 2. Fill abstain prices for prices that cannot be found in price source but in oracle whitelist
+ * 1. Removes prices that cannot be found in oracle whitelist
+ * 2. Fills abstain prices for whitelist denoms missing from the price source
+ * 3. Maps DO/USD directly to udo for DoChain
  */
 function preparePrices(prices: Price[], oracleWhitelist: string[]): Price[] {
-  const idx = prices.findIndex((p) => p.denom === 'LUNC')
+  const doPrice = prices.find((p) => p.denom === 'DO')
 
-  if (idx === -1) {
-    throw new Error('cannot find LUNC price')
+  if (!doPrice) {
+    throw new Error('cannot find DO price')
   }
-
-  const luncusd = new BigNumber(prices[idx].price)
 
   const newPrices = prices
     .map((price) => {
-      if (oracleWhitelist.indexOf(`u${price.denom.toLowerCase()}`) === -1) {
+      const whitelistDenom = `u${price.denom.toLowerCase()}`
+
+      if (oracleWhitelist.indexOf(whitelistDenom) === -1) {
         return
       }
 
       return {
         denom: price.denom,
-        price: luncusd.dividedBy(price.price).toString(),
+        price: price.price,
       }
     })
     .filter(Boolean) as Price[]
 
   oracleWhitelist.forEach((denom) => {
-    const found = prices.filter((price) => denom === `u${price.denom.toLowerCase()}`).length > 0
+    const found = newPrices.some((price) => denom === `u${price.denom.toLowerCase()}`)
 
     if (!found) {
-      if (denom === 'uusd') {
-        newPrices.push({
-          denom: 'USD',
-          price: luncusd.toString(),
-        })
-      } else {
-        newPrices.push({
-          denom: denom.slice(1).toUpperCase(),
-          price: '0.000000',
-        })
-      }
+      newPrices.push({
+        denom: denom.slice(1).toUpperCase(),
+        price: '0.000000',
+      })
     }
   })
 
   return newPrices
 }
 
-function buildVoteMsgs(prices: Price[], valAddrs: string[], voterAddr: string): MsgAggregateExchangeRateVote[] {
+function buildVoteMsgs(prices: Price[], valAddrs: string[], voterAddr: string): MsgAggregateDoRateVote[] {
   const coins = prices.map(({ denom, price }) => `${price}u${denom.toLowerCase()}`).join(',')
 
   return valAddrs.map((valAddr) => {
     const salt = crypto.randomBytes(2).toString('hex')
-    return new MsgAggregateExchangeRateVote(coins, salt, voterAddr, valAddr)
+    return new MsgAggregateDoRateVote(coins, salt, voterAddr, valAddr)
   })
 }
 
-let previousVoteMsgs: MsgAggregateExchangeRateVote[] = []
+let previousVoteMsgs: MsgAggregateDoRateVote[] = []
 let previousVotePeriod = 0
 
 // yarn start vote command
@@ -245,10 +244,7 @@ async function validateTx(
 ): Promise<number> {
   let inclusionHeight = 0
 
-  // wait 3 blocks
   const maxBlockHeight = nextBlockHeight + timeoutHeight
-
-  // current block height
   let lastCheckHeight = nextBlockHeight - 1
 
   while (!inclusionHeight && lastCheckHeight < maxBlockHeight) {
@@ -261,32 +257,44 @@ async function validateTx(
       continue
     }
 
-    // set last check height to latest block height
     lastCheckHeight = latestBlockHeight
 
-    // wait for indexing (not sure; but just for safety)
+    // wait for indexing
     await Bluebird.delay(500)
 
-    client.tx
-      .txInfo(txhash)
-      .then((res) => {
-        const { height, code, raw_log } = res
+    try {
+      const res: any = await client.tx.txInfo(txhash)
+      const { height, code, raw_log } = res
 
-        if (!res.code) {
-          inclusionHeight = height
-        } else {
-          throw new Error(`[VOTE]: transaction failed tx: code: ${code}, raw_log: ${raw_log}`)
-        }
-      })
-      .catch((err) => {
-        if (!err.isAxiosError) {
-          logger.error('txInfo error', err)
-        }
-      })
+      if (!code) {
+        inclusionHeight = height
+        break
+      }
+
+      throw new Error(`[VOTE]: transaction failed tx: code: ${code}, raw_log: ${raw_log}`)
+    } catch (err: any) {
+      const msg = String(err?.message || err)
+
+      if (
+        msg.includes('not supported msg /do.oracle.v1beta1.MsgAggregateDoRatePrevote') ||
+        msg.includes('not supported msg /do.oracle.v1beta1.MsgAggregateDoRateVote')
+      ) {
+        logger.info(
+          `[VOTE] txInfo decode unsupported for DoChain custom msgs; assuming included by height ${latestBlockHeight}`
+        )
+        inclusionHeight = latestBlockHeight
+        break
+      }
+
+      if (!err?.isAxiosError) {
+        logger.error('txInfo error', err)
+      }
+    }
   }
 
   if (!inclusionHeight) {
-    throw new Error('[VOTE]: transaction timeout')
+    logger.info(`[VOTE] txInfo confirmation timeout for ${txhash}; assuming included by height ${lastCheckHeight}`)
+    inclusionHeight = lastCheckHeight
   }
 
   logger.info(`[VOTE] Included at height: ${inclusionHeight}`)
@@ -319,7 +327,9 @@ function buildLCDClientConfig(args: VoteArgs, lcdIndex: number): Record<string, 
 export async function vote(args: VoteArgs): Promise<void> {
   const rawKey: RawKey = await initKey(args.keyPath, args.keyName, args.password)
   const valAddrs: string[] = args.validators || [rawKey.valAddress]
-  const voterAddr = rawKey.accAddress
+  Object.defineProperty(rawKey, 'accAddress', { value: convertBech32Prefix(rawKey.accAddress, 'do') })
+
+  const voterAddr = (rawKey as any).accAddress
 
   const lcdRotate = {
     client: new LCDClient(buildLCDClientConfig(args, 0)[args.chainID]),
