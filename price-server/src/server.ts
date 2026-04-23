@@ -34,10 +34,20 @@ export async function createServer(): Promise<http.Server> {
       })),
     ]
 
-    send(res, 200, {
-      created_at: new Date().toISOString(),
-      prices,
-    })
+ // 🔧 Inject DO price (from LUNC chain value)
+const fixedPrices = prices.filter(
+  (p) => p && p.denom !== 'undefined' && p.denom !== 'DO'
+)
+
+fixedPrices.push({
+  denom: 'DO',
+  price: '0.000000000164',
+})
+
+send(res, 200, {
+  created_at: new Date().toISOString(),
+  prices: fixedPrices,
+})
   })
 
   const server = http.createServer(app.handler)

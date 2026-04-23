@@ -34,7 +34,7 @@ function registerCommands(parser: ArgumentParser): void {
 
   voteCommand.addArgument([`-v`, `--validators`], {
     action: `append`,
-    help: `validators address (e.g. terravaloper1...), can have multiple`,
+    help: `validator address (e.g. dovaloper1...), can have multiple`,
     dest: `validators`,
     required: false,
   })
@@ -90,7 +90,7 @@ async function main(): Promise<void> {
   const parser = new ArgumentParser({
     version: packageInfo.version,
     addHelp: true,
-    description: `Terra oracle voter`,
+    description: `Do Chain oracle voter`,
   })
 
   registerCommands(parser)
@@ -105,7 +105,7 @@ async function main(): Promise<void> {
       args.dataSourceUrl ||
       (process.env.ORACLE_FEEDER_DATA_SOURCE_URL && process.env.ORACLE_FEEDER_DATA_SOURCE_URL.split(',')) ||
       []
-    args.chainID = args.chainID || process.env.ORACLE_FEEDER_CHAIN_ID || 'columbus-5'
+    args.chainID = args.chainID || process.env.ORACLE_FEEDER_CHAIN_ID || 'dochain-1'
     if (args.lcdUrl?.length === 0 || args.dataSourceUrl?.length === 0 || args.chainID === '') {
       console.error('Missing --lcd, --chain-id or --data-source-url')
       return

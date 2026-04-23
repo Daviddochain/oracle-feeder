@@ -2,6 +2,7 @@ import * as fs from 'fs'
 import * as crypto from 'crypto'
 import * as dotenv from 'dotenv' // see https://github.com/motdotla/dotenv#how-do-i-use-dotenv-with-import
 import { MnemonicKey } from '@terra-money/terra.js'
+import { bech32 } from 'bech32'
 
 dotenv.config()
 
@@ -20,6 +21,13 @@ const resizedIV = Buffer.allocUnsafe(16)
 const iv = crypto.createHash('sha256').update(ivSalt).digest()
 
 iv.copy(resizedIV)
+
+
+function convertBech32Prefix(addr: string, prefix: string): string {
+  const decoded = bech32.decode(addr)
+  return bech32.encode(prefix, decoded.words)
+}
+
 
 function encrypt(plainText: string, password: string): string {
   const key = crypto.createHash('sha256').update(password).digest()
@@ -70,6 +78,7 @@ export async function save(
   }
 
   const mnemonicKey = new MnemonicKey({ mnemonic, coinType: Number(coinType) })
+  const accPrefix = process.env.ORACLE_FEEDER_ADDR_PREFIX || 'do'
 
   const ciphertext = encrypt(
     JSON.stringify({
@@ -80,7 +89,7 @@ export async function save(
 
   keys.push({
     name,
-    address: mnemonicKey.accAddress,
+    address: convertBech32Prefix(mnemonicKey.accAddress, accPrefix),
     ciphertext,
   })
 

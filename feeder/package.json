@@ -1,5 +1,5 @@
 {
-  "name": "@classic-terra/oracle-feeder",
+ "name": "@dochain/oracle-feeder" ,
   "version": "3.1.5",
   "main": "src/index.ts",
   "license": "Apache-2.0",

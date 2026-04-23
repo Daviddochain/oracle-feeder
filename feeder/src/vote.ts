@@ -6,11 +6,10 @@ import * as https from 'https'
 import axios from 'axios'
 import { bech32 } from 'bech32'
 import * as ks from './keystore'
-import { LCDClient, RawKey, Wallet, isTxError, LCDClientConfig, OracleAPI, Fee } from '@terra-money/terra.js'
+import { LCDClient, RawKey, Wallet, isTxError, LCDClientConfig, Fee } from '@terra-money/terra.js'
 import * as packageInfo from '../package.json'
 import * as logger from './logger'
-import { MsgAggregateDoRateVote } from './doOracleMsgs'
-import { BigNumber } from 'bignumber.js'
+import { MsgAggregateDoRatePrevote, MsgAggregateDoRateVote, aggregateVoteHash } from './doOracleMsgs'
 
 const ax = axios.create({
   httpAgent: new http.Agent({ keepAlive: true }),
@@ -46,7 +45,7 @@ interface OracleParameters {
   nextBlockHeight: number
 }
 
-async function loadOracleParams(client: LCDClient, oracle: OracleAPI): Promise<OracleParameters> {
+async function loadOracleParams(client: LCDClient): Promise<OracleParameters> {
   const lcdBase = Array.isArray((client as any).config?.URL)
     ? (client as any).config.URL[0]
     : (client as any).config?.URL || (client as any).config?.lcd || 'http://127.0.0.1:1317'
@@ -60,7 +59,6 @@ async function loadOracleParams(client: LCDClient, oracle: OracleAPI): Promise<O
   const latestBlockRes = await ax.get(`${lcdBase}/cosmos/base/tendermint/v1beta1/blocks/latest`)
   const blockHeight = parseInt(latestBlockRes.data.block.header.height, 10)
 
-  // the vote will be included in the next block
   const nextBlockHeight = blockHeight + 1
   const currentVotePeriod = Math.floor(blockHeight / oracleVotePeriod)
   const indexInVotePeriod = nextBlockHeight % oracleVotePeriod
@@ -83,14 +81,13 @@ async function getPrices(sources: string[]): Promise<Price[]> {
   const results = await Bluebird.some(
     sources.map((s) => ax.get(s)),
     1
-  ).then((results) =>
-    results.filter(({ data }) => {
+  ).then((responses: any[]) =>
+    responses.filter(({ data }) => {
       if (typeof data.created_at !== 'string' || !Array.isArray(data.prices) || !data.prices.length) {
         logger.error('getPrices: invalid response')
         return false
       }
 
-      // Ignore prices older than 60 seconds ago
       if (Date.now() - new Date(data.created_at).getTime() > 60 * 1000) {
         logger.error('getPrices: too old')
         return false
@@ -125,7 +122,7 @@ function preparePrices(prices: Price[], oracleWhitelist: string[]): Price[] {
       const whitelistDenom = `u${price.denom.toLowerCase()}`
 
       if (oracleWhitelist.indexOf(whitelistDenom) === -1) {
-        return
+        return undefined
       }
 
       return {
@@ -154,14 +151,24 @@ function buildVoteMsgs(prices: Price[], valAddrs: string[], voterAddr: string): 
 
   return valAddrs.map((valAddr) => {
     const salt = crypto.randomBytes(2).toString('hex')
-    return new MsgAggregateDoRateVote(coins, salt, voterAddr, valAddr)
+    return new MsgAggregateDoRateVote(salt, coins, voterAddr, valAddr)
   })
 }
 
 let previousVoteMsgs: MsgAggregateDoRateVote[] = []
 let previousVotePeriod = 0
 
-// yarn start vote command
+interface VoteArgs {
+  lcdUrl: string[]
+  prefix: string
+  chainID: string
+  validators: string[]
+  dataSourceUrl: string[]
+  password: string
+  keyPath: string
+  keyName: string
+}
+
 export async function processVote(
   client: LCDClient,
   wallet: Wallet,
@@ -169,46 +176,41 @@ export async function processVote(
   valAddrs: string[],
   voterAddr: string
 ): Promise<void> {
-  const oracle = new OracleAPI(client)
   logger.info(`[VOTE] Requesting on chain data`)
   const { oracleVotePeriod, oracleWhitelist, currentVotePeriod, indexInVotePeriod, nextBlockHeight } =
-    await loadOracleParams(client, oracle)
+    await loadOracleParams(client)
 
-  // Skip until new voting period
-  // Skip when index [0, oracleVotePeriod - 1] is bigger than oracleVotePeriod - 2 or index is 0
   if ((previousVotePeriod && currentVotePeriod === previousVotePeriod) || oracleVotePeriod - indexInVotePeriod < 2) {
     return
   }
 
-  // If it failed to reveal the price,
-  // reset the state by throwing error
   if (previousVotePeriod && currentVotePeriod - previousVotePeriod !== 1) {
     throw new Error('Failed to Reveal Exchange Rates; reset to prevote')
   }
 
-  // Print timestamp before start
   logger.info(`[VOTE] Requesting prices from price server ${args.dataSourceUrl.join(',')}`)
   const _prices = await getPrices(args.dataSourceUrl)
-
-  // Removes non-whitelisted currencies and abstain for not fetched currencies
   const prices = preparePrices(_prices, oracleWhitelist)
+  const voteMsgs: MsgAggregateDoRateVote[] = buildVoteMsgs(prices, valAddrs, voterAddr)
 
-  // Build Exchange Rate Vote Msgs
-  const voteMsgs: any[] = buildVoteMsgs(prices, valAddrs, voterAddr)
-
-  logger.info(`[VOTE] Create transaction and sign`)
-  // Build Exchange Rate Prevote Msgs
   const isPrevoteOnlyTx = previousVoteMsgs.length === 0
-  const msgs = [...previousVoteMsgs, ...voteMsgs.map((vm) => vm.getPrevote())]
-  logger.info(`[PREVOTE] msg: ${JSON.stringify(msgs)}\n`)
-  const tx = await wallet.createAndSignTx({
-    msgs,
-    fee: new Fee((1 + msgs.length) * 100_000, []),
-    memo: `${packageInfo.name}@${packageInfo.version}`,
+
+  const prevoteMsgs: MsgAggregateDoRatePrevote[] = voteMsgs.map((vm) => {
+    const hash = aggregateVoteHash(vm.exchange_rates, vm.salt, vm.validator)
+    return new MsgAggregateDoRatePrevote(hash, vm.feeder, vm.validator)
   })
 
-  const res = await client.tx.broadcastSync(tx).catch((err) => {
-    logger.error(`broadcast error: ${err.message} ${tx.toData(client.config.isClassic)}`)
+  const msgs: any[] = [...previousVoteMsgs, ...prevoteMsgs]
+  logger.info(`[${isPrevoteOnlyTx ? 'PREVOTE' : 'VOTE'}] msg: ${JSON.stringify(msgs)}\n`)
+
+  const tx = await wallet.createAndSignTx({
+    msgs: msgs as any,
+    fee: new Fee((1 + msgs.length) * 100_000, []),
+    memo: `${packageInfo.name}@${packageInfo.version}`,
+  } as any)
+
+  const res = await client.tx.broadcastSync(tx).catch((err: any) => {
+    logger.error(`broadcast error: ${err.message} ${tx.toData((client as any).config?.isClassic)}`)
     throw err
   })
 
@@ -225,12 +227,9 @@ export async function processVote(
     nextBlockHeight,
     txhash,
     args,
-    // if only prevote exist, then wait 2 * vote_period blocks,
-    // else wait left blocks in the current vote_period
     isPrevoteOnlyTx ? oracleVotePeriod * 2 : oracleVotePeriod - indexInVotePeriod
   )
 
-  // Update last success VotePeriod
   previousVotePeriod = Math.floor(height / oracleVotePeriod)
   previousVoteMsgs = voteMsgs
 }
@@ -239,13 +238,17 @@ async function validateTx(
   client: LCDClient,
   nextBlockHeight: number,
   txhash: string,
-  args: VoteArgs,
+  _args: VoteArgs,
   timeoutHeight: number
 ): Promise<number> {
   let inclusionHeight = 0
 
   const maxBlockHeight = nextBlockHeight + timeoutHeight
   let lastCheckHeight = nextBlockHeight - 1
+
+  const lcdBase = Array.isArray((client as any).config?.URL)
+    ? (client as any).config.URL[0]
+    : (client as any).config?.URL || (client as any).config?.lcd || 'http://127.0.0.1:1317'
 
   while (!inclusionHeight && lastCheckHeight < maxBlockHeight) {
     await Bluebird.delay(1500)
@@ -259,57 +262,74 @@ async function validateTx(
 
     lastCheckHeight = latestBlockHeight
 
-    // wait for indexing
-    await Bluebird.delay(500)
-
     try {
-      const res: any = await client.tx.txInfo(txhash)
-      const { height, code, raw_log } = res
+      const res = await ax.get(`${lcdBase}/cosmos/tx/v1beta1/txs/${txhash}`)
+      const txResponse = res?.data?.tx_response
 
-      if (!code) {
-        inclusionHeight = height
-        break
+      if (!txResponse) {
+        continue
       }
 
-      throw new Error(`[VOTE]: transaction failed tx: code: ${code}, raw_log: ${raw_log}`)
+      const height = parseInt(txResponse.height, 10) || latestBlockHeight
+      const code = Number(txResponse.code || 0)
+      const rawLog = txResponse.raw_log || ''
+
+      if (code !== 0) {
+        throw new Error(`[VOTE]: transaction failed tx: code: ${code}, raw_log: ${rawLog}`)
+      }
+
+      inclusionHeight = height
+      break
     } catch (err: any) {
-      const msg = String(err?.message || err)
+      const status = err?.response?.status
 
-      if (
-        msg.includes('not supported msg /do.oracle.v1beta1.MsgAggregateDoRatePrevote') ||
-        msg.includes('not supported msg /do.oracle.v1beta1.MsgAggregateDoRateVote')
-      ) {
-        logger.info(
-          `[VOTE] txInfo decode unsupported for DoChain custom msgs; assuming included by height ${latestBlockHeight}`
-        )
-        inclusionHeight = latestBlockHeight
-        break
+      if (status === 404) {
+        continue
       }
 
-      if (!err?.isAxiosError) {
-        logger.error('txInfo error', err)
+      if (err?.isAxiosError && !err?.response) {
+        logger.error('tx query network error', err.message)
+        continue
       }
+
+      if (err instanceof Error) {
+        throw err
+      }
+
+      throw new Error(String(err))
     }
   }
 
   if (!inclusionHeight) {
-    logger.info(`[VOTE] txInfo confirmation timeout for ${txhash}; assuming included by height ${lastCheckHeight}`)
-    inclusionHeight = lastCheckHeight
+    throw new Error(`[VOTE] tx confirmation timeout for ${txhash} by height ${lastCheckHeight}`)
   }
 
   logger.info(`[VOTE] Included at height: ${inclusionHeight}`)
   return inclusionHeight
 }
 
-interface VoteArgs {
-  lcdUrl: string[]
-  prefix: string
-  chainID: string
-  validators: string[]
-  dataSourceUrl: string[]
-  password: string
-  keyPath: string
-  keyName: string
+function getAccPrefix(args: VoteArgs): string {
+  return args.prefix || process.env.ORACLE_FEEDER_ADDR_PREFIX || 'do'
+}
+
+function getValoperPrefix(args: VoteArgs): string {
+  return process.env.ORACLE_FEEDER_VALOPER_PREFIX || `${getAccPrefix(args)}valoper`
+}
+
+function getFeeDenom(args: VoteArgs): string {
+  return process.env.ORACLE_FEEDER_GAS_DENOM || `u${getAccPrefix(args)}`
+}
+
+function getGasPrice(): number {
+  const gasPrice = Number(process.env.ORACLE_FEEDER_GAS_PRICE || '0.0015')
+  return Number.isFinite(gasPrice) && gasPrice > 0 ? gasPrice : 0.0015
+}
+
+function normalizeValidatorAddresses(args: VoteArgs, rawKey: RawKey): string[] {
+  const valoperPrefix = getValoperPrefix(args)
+  const configuredValidators = args.validators && args.validators.length ? args.validators : [((rawKey as any).valAddress || '')]
+
+  return configuredValidators.map((addr) => convertBech32Prefix(addr, valoperPrefix))
 }
 
 function buildLCDClientConfig(args: VoteArgs, lcdIndex: number): Record<string, LCDClientConfig> {
@@ -318,7 +338,7 @@ function buildLCDClientConfig(args: VoteArgs, lcdIndex: number): Record<string, 
       URL: args.lcdUrl[lcdIndex],
       chainID: args.chainID,
       gasAdjustment: '1.5',
-      gasPrices: { ucandle: 0.0015 },
+      gasPrices: { [getFeeDenom(args)]: getGasPrice() },
       isClassic: true,
     },
   }
@@ -326,8 +346,9 @@ function buildLCDClientConfig(args: VoteArgs, lcdIndex: number): Record<string, 
 
 export async function vote(args: VoteArgs): Promise<void> {
   const rawKey: RawKey = await initKey(args.keyPath, args.keyName, args.password)
-  const valAddrs: string[] = args.validators || [rawKey.valAddress]
-  Object.defineProperty(rawKey, 'accAddress', { value: convertBech32Prefix(rawKey.accAddress, 'do') })
+  const accPrefix = getAccPrefix(args)
+  const valAddrs: string[] = normalizeValidatorAddresses(args, rawKey)
+  Object.defineProperty(rawKey, 'accAddress', { value: convertBech32Prefix((rawKey as any).accAddress, accPrefix) })
 
   const voterAddr = (rawKey as any).accAddress
 
@@ -340,7 +361,7 @@ export async function vote(args: VoteArgs): Promise<void> {
   while (true) {
     const startTime = Date.now()
 
-    await processVote(lcdRotate.client, lcdRotate.client.wallet(rawKey), args, valAddrs, voterAddr).catch((err) => {
+    await processVote(lcdRotate.client, lcdRotate.client.wallet(rawKey), args, valAddrs, voterAddr).catch((err: any) => {
       if (err.isAxiosError && err.response) {
         logger.error(err.message, err.response.data)
       } else {
@@ -366,8 +387,6 @@ function rotateLCD(args: VoteArgs, lcdRotate: { client: LCDClient; current: numb
 
   lcdRotate.client = new LCDClient(buildLCDClientConfig(args, lcdRotate.current)[args.chainID])
   logger.info('Switched to LCD address ' + lcdRotate.current + '(' + args.lcdUrl[lcdRotate.current] + ')')
-
-  return
 }
 
 function resetPrevote() {
